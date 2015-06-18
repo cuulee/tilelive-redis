@@ -1,4 +1,5 @@
 var assert = require('assert');
+var bufferEqual = require('buffer-equal');
 var Redsource = require('../index');
 var redis = Redsource.redis;
 var deadclient = redis.createClient(6380, '127.0.0.1', {});
@@ -45,7 +46,7 @@ describe('load', function() {
         done();
     });
     it('sets client from opts', function(done) {
-        var client = redis.createClient();
+        var client = redis.createClient({return_buffers: true});
         var Source = Redsource({ client: client, expires:5 }, Testsource);
         assert.ok(Source.redis);
         assert.strictEqual(Source.redis.client, client);
@@ -57,21 +58,17 @@ var tile = function(expected, cached, done) {
     return function(err, data, headers) {
         assert.ifError(err);
         assert.ok(data instanceof Buffer);
-        assert.ok(cached ? headers['x-redis'] : !headers['x-redis']);
+        assert.ok(cached ? !headers : headers['x-testsource']);
         assert[cached ? 'deepEqual' : 'strictEqual'](data, expected);
         assert.equal(data.length, expected.length);
-        assert.equal(headers['content-type'], 'image/png');
-        assert.equal(headers['last-modified'], now.toUTCString());
         done();
     };
 };
 var grid = function(expected, cached, done) {
     return function(err, data, headers) {
         assert.ifError(err);
-        assert.ok(cached ? headers['x-redis'] : !headers['x-redis']);
+        assert.ok(cached ? !headers : headers['x-testsource']);
         assert.deepEqual(data, expected);
-        assert.equal(headers['content-type'], 'application/json');
-        assert.equal(headers['last-modified'], now.toUTCString());
         done();
     };
 };
@@ -487,7 +484,6 @@ describe('cachingGet', function() {
         wrapped('asdf', function(err, data, headers) {
             assert.ifError(err);
             assert.deepEqual(data, {id:'asdf'}, 'returns data');
-            assert.deepEqual(headers, {'x-redis-json':true, 'x-redis':'hit'}, 'headers, hit');
             assert.equal(stats.asdf, 1, 'asdf IO x1');
             done();
         });
@@ -556,32 +552,32 @@ describe('unit', function() {
         var errstat404 = new Error(); errstat404.status = 404;
         var errstat403 = new Error(); errstat403.status = 403;
         var errstat500 = new Error(); errstat500.status = 500;
-        assert.equal(Redsource.encode(errcode404), '404');
-        assert.equal(Redsource.encode(errcode403), '403');
+        assert.equal(Redsource.encode(errcode404), 'E404');
+        assert.equal(Redsource.encode(errcode403), 'E403');
         assert.equal(Redsource.encode(errcode500), null);
-        assert.equal(Redsource.encode(errstat404), '404');
-        assert.equal(Redsource.encode(errstat403), '403');
+        assert.equal(Redsource.encode(errstat404), 'E404');
+        assert.equal(Redsource.encode(errstat403), 'E403');
         assert.equal(Redsource.encode(errstat500), null);
-        assert.equal(Redsource.encode(null, {id:'foo'}), '{"x-redis-json":true}eyJpZCI6ImZvbyJ9', 'encodes object');
-        assert.equal(Redsource.encode(null, 'hello world'), '{}aGVsbG8gd29ybGQ=', 'encodes string');
-        assert.equal(Redsource.encode(null, new Buffer(0)), '{}', 'encodes empty buffer');
+        assert.ok(bufferEqual(
+          Redsource.encode(null, {id:'foo'}),
+          Buffer.concat([new Buffer('O'), new Buffer(JSON.stringify({id:'foo'}))]), 'encodes object')
+        );
+        assert.ok(bufferEqual(
+          Redsource.encode(null, 'hello world'),
+          Buffer.concat([new Buffer('S'), new Buffer('hello world')]), 'encodes string')
+        );
+        assert.ok(bufferEqual(
+          Redsource.encode(null, new Buffer(0)),
+          new Buffer('B')
+        ));
         done();
     });
     it('decode', function(done) {
-        assert.deepEqual(Redsource.decode('404'), {err:{code:404,status:404,redis:true}});
-        assert.deepEqual(Redsource.decode('403'), {err:{code:403,status:403,redis:true}});
-        assert.deepEqual(Redsource.decode('{"x-redis-json":true}eyJpZCI6ImZvbyJ9'), {
-            headers:{'x-redis-json':true,'x-redis':'hit'},
-            buffer:{'id':'foo'}
-        }, 'decodes object');
-        assert.deepEqual(Redsource.decode('{}aGVsbG8gd29ybGQ='), {
-            headers:{'x-redis':'hit'},
-            buffer:new Buffer('hello world')
-        }, 'decodes string (as buffer)');
-        assert.deepEqual(Redsource.decode('{}'), {
-            headers:{'x-redis':'hit'},
-            buffer:new Buffer(0)
-        }, 'decodes buffer');
+        assert.deepEqual(Redsource.decode(new Buffer('E404')), {code:404,status:404,redis:true});
+        assert.deepEqual(Redsource.decode(new Buffer('E403')), {code:403,status:403,redis:true});
+        assert.equal(Redsource.decode(new Buffer('Sfoo')), 'foo');
+        assert.deepEqual(Redsource.decode(new Buffer('O{"id":"foo"}')), {id:'foo'});
+        assert.deepEqual(Redsource.decode(new Buffer('B')), new Buffer(0));
         done();
     });
 });

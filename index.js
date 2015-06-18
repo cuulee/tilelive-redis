@@ -1,6 +1,7 @@
 var urlParse = require('url').parse;
 var util = require('util');
 var redis = require('redis');
+var bufferEqual = require('buffer-equal');
 
 module.exports = function(options, Source) {
     if (!Source) throw new Error('No source provided');
@@ -24,7 +25,11 @@ module.exports.cachingGet = function(namespace, options, get) {
     if (!namespace) throw new Error('No namespace provided');
 
     options = options || {};
-    options.client = ('client' in options) ? options.client : redis.createClient();
+    if (options.client) {
+        options.client.options.return_buffers = true;
+    } else {
+        options.client = redis.createClient({return_buffers: true});
+    }
     options.expires = ('expires' in options) ? options.expires : 300;
     options.mode = ('mode' in options) ? options.mode : 'readthrough';
 
@@ -56,7 +61,7 @@ module.exports.cachingGet = function(namespace, options, get) {
 
         // GET upstream.
         get.call(source, url, function(err, buffer, headers) {
-            current = encode(err, buffer, headers);
+            current = encode(err, buffer);
             if (cached && current) finalize();
             if (sent) return;
             sent = true;
@@ -84,7 +89,8 @@ module.exports.cachingGet = function(namespace, options, get) {
                 }
                 if (data) {
                     sent = true;
-                    callback(data.err, data.buffer, data.headers);
+                    if (data instanceof Error) return callback(data);
+                    else return callback(null, data);
                 }
             });
         } else {
@@ -92,7 +98,7 @@ module.exports.cachingGet = function(namespace, options, get) {
         }
 
         function finalize() {
-            if (cached === current) return;
+            if (bufferEqual(cached, current)) return;
             client.setex(key, expires, current, function(err) {
                 if (!err) return;
                 err.key = key;
@@ -130,14 +136,17 @@ module.exports.cachingGet = function(namespace, options, get) {
                     err.key = key;
                     client.emit('error', err);
                 }
-                if (data) return callback(data.err, data.buffer, data.headers);
+                if (data && (data instanceof Error))
+                    return callback(data);
+                else if (data)
+                    return callback(null, data);
 
                 // Cache miss, error, or otherwise no data
                 get.call(source, url, function(err, buffer, headers) {
                     if (err && !errcode(err)) return callback(err);
                     callback(err, buffer, headers);
                     // Callback does not need to wait for redis set to occur.
-                    client.setex(key, expires, encode(err, buffer, headers), function(err) {
+                    client.setex(key, expires, encode(err, buffer), function(err) {
                         if (!err) return;
                         err.key = key;
                         client.emit('error', err);
@@ -166,48 +175,42 @@ function errcode(err) {
     return;
 }
 
-function encode(err, buffer, headers) {
-    if (errcode(err)) return errcode(err).toString();
+function encode(err, buffer) {
+    if (errcode(err)) return 'E' + errcode(err).toString();
 
     // Unhandled error.
     if (err) return null;
 
-    headers = headers || {};
-
     // Turn objects into JSON string buffers.
     if (buffer && typeof buffer === 'object' && !(buffer instanceof Buffer)) {
-        headers['x-redis-json'] = true;
         buffer = new Buffer(JSON.stringify(buffer));
+        buffer = Buffer.concat([new Buffer('O'), buffer], buffer.length + 1);
     // Turn strings into buffers.
     } else if (buffer && !(buffer instanceof Buffer)) {
         buffer = new Buffer(buffer);
+        buffer = Buffer.concat([new Buffer('S'), buffer], buffer.length + 1);
+    } else {
+    // Consider it binary
+        buffer = Buffer.concat([new Buffer('B'), buffer], buffer.length + 1);
     }
-
-    return JSON.stringify(headers) + buffer.toString('base64');
+    return buffer;
 };
 
 function decode(encoded) {
-    if (encoded === '404' || encoded === '403') {
+    var types = ['O','S','B'];
+    var hint = encoded.slice(0, 1).toString();
+    var buffer = encoded.slice(1);
+    if (hint === 'E' && (buffer.toString() === '404' || buffer.toString() === '403')) {
         var err = new Error();
-        err.code = parseInt(encoded, 10);
-        err.status = parseInt(encoded, 10);
+        err.code = parseInt(buffer, 10);
+        err.status = parseInt(buffer, 10);
         err.redis = true;
-        return { err: err };
+        return err;
     }
 
-    var breaker = encoded.indexOf('}');
-    if (breaker === -1) return new Error('Invalid cache value');
+    if (types.indexOf(hint) < 0) return new Error('Invalid cache value');
 
-    var data = {};
-    data.headers = JSON.parse(encoded.substr(0, breaker+1));
-    data.headers['x-redis'] = 'hit';
-    data.buffer = new Buffer(encoded.substr(breaker), 'base64');
-
-    // Return JSON-encoded objects to true form.
-    if (data.headers['x-redis-json']) data.buffer = JSON.parse(data.buffer);
-
-    if (data.headers['content-length'] && data.headers['content-length'] != data.buffer.length)
-        throw new Error('Content length does not match');
-    return data;
+    if (hint === 'O') buffer = JSON.parse(buffer.toString());
+    else if (hint === 'S') buffer = buffer.toString();
+    return buffer;
 };
-
